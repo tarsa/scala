@@ -208,8 +208,11 @@ private[concurrent] final object Promise {
     override final def completeWith(other: Future[T]): this.type = {
       val state = get()
       if ((other ne this) && !state.isInstanceOf[Try[T]]) {
-        val resolved = if (other.isInstanceOf[DefaultPromise[T]]) other.asInstanceOf[DefaultPromise[T]].value0 else null
-        if (resolved ne null) tryComplete0(state, resolved)
+        if (other.isInstanceOf[DefaultPromise[T]]) {
+          val resolved = other.asInstanceOf[DefaultPromise[T]].value0
+          if (resolved ne null) tryComplete0(state, resolved)
+          else other.onComplete(tryComplete0(get(),_))(Future.InternalCallbackExecutor)
+        }
         else super.completeWith(other)
       }
 
