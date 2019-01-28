@@ -37,6 +37,33 @@ trait TestBase {
 }
 
 
+class FutureCompleteWith extends TestBase {
+  import ExecutionContext.Implicits._
+
+  def testMutual(): Unit = once {
+    done =>
+      val promise1 = Promise[Int]()
+      val promise2 = Promise[Int]()
+      promise1.completeWith(promise2.future)
+      promise2.completeWith(promise1.future)
+      promise1.success(5)
+      done(promise1.isCompleted && promise2.isCompleted)
+  }
+
+  def testStackOverflow(): Unit = once {
+    done =>
+      val promises = Vector.fill(123456)(Promise[String]())
+      for ((prev, next) <- promises.init.zip(promises.tail)) {
+        prev.completeWith(next.future)
+      }
+      promises.last.success("")
+      promises.head.future.foreach(_ => done(true))
+  }
+
+  test("testCompleteWithMutual")(testMutual())
+  test("testCompleteWithStackOverflow")(testStackOverflow())
+}
+
 class FutureCallbacks extends TestBase {
   import ExecutionContext.Implicits._
 
@@ -224,7 +251,7 @@ def testTransformFailure(): Unit = once {
   }
 
   def testTransformResultToFailure(): Unit = once {
-    done => 
+    done =>
       val e = new Exception("expected")
       Future("foo").transform {
         case Success(s) => Failure(e)
@@ -271,7 +298,7 @@ def testTransformFailure(): Unit = once {
   }
 
   def testTransformWithResultToFailure(): Unit = once {
-    done => 
+    done =>
       val e = new Exception("expected")
       Future("foo").transformWith {
         case Success(s) => Future(throw e)
@@ -848,7 +875,7 @@ class Exceptions extends TestBase {
 
 class GlobalExecutionContext extends TestBase {
   import ExecutionContext.Implicits._
-  
+
   def testNameOfGlobalECThreads(): Unit = once {
     done => Future({
         val expectedName = "scala-execution-context-global-"+ Thread.currentThread.getId
@@ -1063,6 +1090,7 @@ class ExecutionContextPrepare extends TestBase {
 
 object Test
 extends App {
+  new FutureCompleteWith
   new FutureCallbacks
   new FutureCombinators
   new FutureProjections

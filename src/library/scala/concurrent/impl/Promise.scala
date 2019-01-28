@@ -214,7 +214,7 @@ private[concurrent] final object Promise {
           val otherP = other.asInstanceOf[DefaultPromise[T]]
           val otherS = otherP.get()
           if (otherS.isInstanceOf[Try[T]]) tryComplete0(state, otherS.asInstanceOf[Try[T]])
-          else completeWith0(otherP, otherS)
+          else completeWith0(otherP, otherS) // otherS.isInstanceOf[Callbacks[T]]
         }
         else super.completeWith(other)
       }
@@ -232,8 +232,7 @@ private[concurrent] final object Promise {
      */
     @tailrec private final def dispatchOrAddCallbacks(state: AnyRef, callback: Transformation[T, _]): callback.type =
       if (state.isInstanceOf[Try[T]]) {
-        submitWithValue(callback, state.asInstanceOf[Try[T]]) // invariant: callbacks should never be Noop here
-        callback
+        callback.submitWithValue(state.asInstanceOf[Try[T]]) // invariant: callback should never be Noop here
       } else /* if (state.isInstanceOf[Callbacks[T]]) */ {
         if(compareAndSet(state, if (state ne Noop) concatCallbacks(callback, state.asInstanceOf[Callbacks[T]]) else callback)) callback
         else dispatchOrAddCallbacks(get(), callback)
@@ -301,18 +300,11 @@ private[concurrent] final object Promise {
     // Invariant: _arg is `ExecutionContext`, and non-null. `this` ne Noop.
     // requireNonNull(resolved) will hold as guarded by `resolve`
     final def submitWithValue(resolved: Try[F]): this.type = {
-      if (_xform != Xform_completeWith) {
-        val e = _arg.asInstanceOf[ExecutionContext]
-        _arg = resolved
-        try e.execute(this) /* Safe publication of _arg and _fun */
-        catch {
-          case t: Throwable => handleFailure(t, e)
-        }
-      } else {
-        // TODO is bypass below legal? we don't run any user provided function anyway
-        doCompleteWith(resolved)
-        _fun = null // allow to GC
-        _arg = null // see above
+      val e = _arg.asInstanceOf[ExecutionContext]
+      _arg = resolved
+      try e.execute(this) /* Safe publication of _arg and _fun */
+      catch {
+        case t: Throwable => handleFailure(t, e)
       }
 
       this
@@ -346,6 +338,7 @@ private[concurrent] final object Promise {
           case Xform_recoverWith   => doRecoverWith(v)
           case Xform_filter        => doFilter(v)
           case Xform_collect       => doCollect(v)
+          case Xform_completeWith  => doCompleteWith(v)
           case _                   => doAbort(v)
         }
         _fun = null // allow to GC
