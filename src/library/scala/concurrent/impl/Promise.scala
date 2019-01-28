@@ -64,7 +64,7 @@ private[concurrent] final object Promise {
       }
 
   // Left non-final to enable addition of extra fields by Java/Scala converters in scala-java8-compat.
-  class DefaultPromise[T] private[this] (initial: AnyRef) extends AtomicReference[AnyRef](initial) with scala.concurrent.Promise[T] with scala.concurrent.Future[T] {
+  class DefaultPromise[T] private[this] (initial: AnyRef) extends AtomicReference[AnyRef](initial) with scala.concurrent.Promise[T] with scala.concurrent.Future[T] with (Any => Any) {
     /**
      * Constructs a new, completed, Promise.
      */
@@ -74,6 +74,8 @@ private[concurrent] final object Promise {
      * Constructs a new, un-completed, Promise.
      */
     final def this() = this(Noop: AnyRef)
+
+    override def apply(v: Any): Any = ???
 
     /**
      * Returns the associated `Future` with this `Promise`
@@ -209,14 +211,20 @@ private[concurrent] final object Promise {
       val state = get()
       if ((other ne this) && !state.isInstanceOf[Try[T]]) {
         if (other.isInstanceOf[DefaultPromise[T]]) {
-          val resolved = other.asInstanceOf[DefaultPromise[T]].value0
-          if (resolved ne null) tryComplete0(state, resolved)
-          else other.onComplete(tryComplete0(get(),_))(Future.InternalCallbackExecutor)
+          val otherP = other.asInstanceOf[DefaultPromise[T]]
+          val otherS = otherP.get()
+          if (otherS.isInstanceOf[Try[T]]) tryComplete0(state, otherS.asInstanceOf[Try[T]])
+          else completeWith0(otherP, otherS)
         }
         else super.completeWith(other)
       }
 
       this
+    }
+
+    private[this] def completeWith0(otherP: DefaultPromise[T], otherS: AnyRef): Unit = {
+      val transformation = new Transformation[T, Unit](Xform_completeWith, this, Future.InternalCallbackExecutor)
+      otherP.dispatchOrAddCallbacks(otherS, transformation)
     }
 
     /** Tries to add the callback, if already completed, it dispatches the callback to be executed.
@@ -261,6 +269,7 @@ private[concurrent] final object Promise {
   final val Xform_recoverWith   = 8
   final val Xform_filter        = 9
   final val Xform_collect       = 10
+  final val Xform_completeWith  = 11
 
     /* Marker trait
    */
@@ -292,11 +301,18 @@ private[concurrent] final object Promise {
     // Invariant: _arg is `ExecutionContext`, and non-null. `this` ne Noop.
     // requireNonNull(resolved) will hold as guarded by `resolve`
     final def submitWithValue(resolved: Try[F]): this.type = {
-      val e = _arg.asInstanceOf[ExecutionContext]
-      _arg = resolved
-      try e.execute(this) /* Safe publication of _arg and _fun */
-      catch {
-        case t: Throwable => handleFailure(t, e)
+      if (_xform != Xform_completeWith) {
+        val e = _arg.asInstanceOf[ExecutionContext]
+        _arg = resolved
+        try e.execute(this) /* Safe publication of _arg and _fun */
+        catch {
+          case t: Throwable => handleFailure(t, e)
+        }
+      } else {
+        // TODO is bypass below legal? we don't run any user provided function anyway
+        doCompleteWith(resolved)
+        _fun = null // allow to GC
+        _arg = null // see above
       }
 
       this
@@ -375,6 +391,11 @@ private[concurrent] final object Promise {
         if (v.isInstanceOf[Success[F]]) Success(_fun.asInstanceOf[PartialFunction[F, T]].applyOrElse(v.asInstanceOf[Success[F]].value, Future.collectFailed))
         else v.asInstanceOf[Try[T]] // Already resolved
       )
+
+    private[this] final def doCompleteWith(v: Try[F]): Unit = {
+      val target = _fun.asInstanceOf[DefaultPromise[T]]
+      target.tryComplete0(target.get(), v.asInstanceOf[Try[T]])
+    }
 
     private[this] final def doAbort(v: Try[F]): Unit =
       tryComplete0(get(), Failure(new IllegalStateException("BUG: encountered transformation promise with illegal type: " + _xform)))
