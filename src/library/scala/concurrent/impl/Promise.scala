@@ -75,7 +75,7 @@ private[concurrent] final object Promise {
      */
     final def this() = this(Noop: AnyRef)
 
-    override def apply(v: Any): Any = ???
+    override def apply(v: Any): Any = null
 
     /**
      * Returns the associated `Future` with this `Promise`
@@ -83,49 +83,49 @@ private[concurrent] final object Promise {
     override final def future: Future[T] = this
 
     override final def transform[S](f: Try[T] => Try[S])(implicit executor: ExecutionContext): Future[S] =
-      dispatchOrAddCallbacks(get(), new Transformation[T, S](Xform_transform, f, executor))
+      dispatchOrAddCallback(get(), new Transformation[T, S](Xform_transform, f, executor))
 
     override final def transformWith[S](f: Try[T] => Future[S])(implicit executor: ExecutionContext): Future[S] =
-      dispatchOrAddCallbacks(get(), new Transformation[T, S](Xform_transformWith, f, executor))
+      dispatchOrAddCallback(get(), new Transformation[T, S](Xform_transformWith, f, executor))
 
     override final def foreach[U](f: T => U)(implicit executor: ExecutionContext): Unit = {
       val state = get()
-      if (!state.isInstanceOf[Failure[T]]) dispatchOrAddCallbacks(state, new Transformation[T, Unit](Xform_foreach, f, executor))
+      if (!state.isInstanceOf[Failure[T]]) dispatchOrAddCallback(state, new Transformation[T, Unit](Xform_foreach, f, executor))
     }
 
     override final def flatMap[S](f: T => Future[S])(implicit executor: ExecutionContext): Future[S] = {
       val state = get()
-      if (!state.isInstanceOf[Failure[T]]) dispatchOrAddCallbacks(state, new Transformation[T, S](Xform_flatMap, f, executor))
+      if (!state.isInstanceOf[Failure[T]]) dispatchOrAddCallback(state, new Transformation[T, S](Xform_flatMap, f, executor))
       else this.asInstanceOf[Future[S]]
     }
 
     override final def map[S](f: T => S)(implicit executor: ExecutionContext): Future[S] = {
       val state = get()
-      if (!state.isInstanceOf[Failure[T]]) dispatchOrAddCallbacks(state, new Transformation[T, S](Xform_map, f, executor))
+      if (!state.isInstanceOf[Failure[T]]) dispatchOrAddCallback(state, new Transformation[T, S](Xform_map, f, executor))
       else this.asInstanceOf[Future[S]]
     }
 
     override final def filter(p: T => Boolean)(implicit executor: ExecutionContext): Future[T] = {
       val state = get()
-      if (!state.isInstanceOf[Failure[T]]) dispatchOrAddCallbacks(state, new Transformation[T, T](Xform_filter, p, executor)) // Short-circuit if we get a Success
+      if (!state.isInstanceOf[Failure[T]]) dispatchOrAddCallback(state, new Transformation[T, T](Xform_filter, p, executor)) // Short-circuit if we get a Success
       else this
     }
 
     override final def collect[S](pf: PartialFunction[T, S])(implicit executor: ExecutionContext): Future[S] = {
       val state = get()
-      if (!state.isInstanceOf[Failure[T]]) dispatchOrAddCallbacks(state, new Transformation[T, S](Xform_collect, pf, executor)) // Short-circuit if we get a Success
+      if (!state.isInstanceOf[Failure[T]]) dispatchOrAddCallback(state, new Transformation[T, S](Xform_collect, pf, executor)) // Short-circuit if we get a Success
       else this.asInstanceOf[Future[S]]
     }
 
     override final def recoverWith[U >: T](pf: PartialFunction[Throwable, Future[U]])(implicit executor: ExecutionContext): Future[U] = {
       val state = get()
-      if (!state.isInstanceOf[Success[T]]) dispatchOrAddCallbacks(state, new Transformation[T, U](Xform_recoverWith, pf, executor)) // Short-circuit if we get a Failure
+      if (!state.isInstanceOf[Success[T]]) dispatchOrAddCallback(state, new Transformation[T, U](Xform_recoverWith, pf, executor)) // Short-circuit if we get a Failure
       else this.asInstanceOf[Future[U]]
     }
 
     override final def recover[U >: T](pf: PartialFunction[Throwable, U])(implicit executor: ExecutionContext): Future[U] = {
       val state = get()
-      if (!state.isInstanceOf[Success[T]]) dispatchOrAddCallbacks(state, new Transformation[T, U](Xform_recover, pf, executor)) // Short-circuit if we get a Failure
+      if (!state.isInstanceOf[Success[T]]) dispatchOrAddCallback(state, new Transformation[T, U](Xform_recover, pf, executor)) // Short-circuit if we get a Failure
       else this.asInstanceOf[Future[U]]
     }
 
@@ -135,7 +135,7 @@ private[concurrent] final object Promise {
 
 
     override final def onComplete[U](func: Try[T] => U)(implicit executor: ExecutionContext): Unit =
-      dispatchOrAddCallbacks(get(), new Transformation[T, Unit](Xform_onComplete, func, executor))
+      dispatchOrAddCallback(get(), new Transformation[T, Unit](Xform_onComplete, func, executor))
 
     override final def failed: Future[Throwable] =
       if (!get().isInstanceOf[Success[T]]) super.failed
@@ -198,13 +198,19 @@ private[concurrent] final object Promise {
       else tryComplete0(state, resolve(value))
     }
 
-    @tailrec // WARNING: important that the supplied Try really is resolve():d
+    private final def startingMaxDepth = 250
+
+    // WARNING: important that the supplied Try really is resolve():d
     private[Promise] final def tryComplete0(state: AnyRef, resolved: Try[T]): Boolean =
+      tryComplete1(state, resolved, startingMaxDepth)
+
+    @tailrec // WARNING: important that the supplied Try really is resolve():d
+    private[Promise] final def tryComplete1(state: AnyRef, resolved: Try[T], maxDepth: Int): Boolean =
       if (state.isInstanceOf[Callbacks[T]]) {
         if (compareAndSet(state, resolved)) {
-          if (state ne Noop) submitWithValue(state.asInstanceOf[Callbacks[T]], resolved)
+          if (state ne Noop) submitWithValue(state.asInstanceOf[Callbacks[T]], resolved, maxDepth - 1)
           true
-        } else tryComplete0(get(), resolved)
+        } else tryComplete1(get(), resolved, maxDepth)
       } else /* if(state.isInstanceOf[Try[T]]) */ false
 
     override final def completeWith(other: Future[T]): this.type = {
@@ -224,18 +230,30 @@ private[concurrent] final object Promise {
 
     private[this] def completeWith0(otherP: DefaultPromise[T], otherS: AnyRef): Unit = {
       val transformation = new Transformation[T, Unit](Xform_completeWith, this, Future.InternalCallbackExecutor)
-      otherP.dispatchOrAddCallbacks(otherS, transformation)
+      otherP.dispatchOrAddCompleteWith(otherS, transformation)
     }
 
     /** Tries to add the callback, if already completed, it dispatches the callback to be executed.
-     *  Used by `onComplete()` to add callbacks to a promise.
+     *  Used by `completeWith()` to add callbacks to a promise.
      */
-    @tailrec private final def dispatchOrAddCallbacks(state: AnyRef, callback: Transformation[T, _]): callback.type =
+    @tailrec private final def dispatchOrAddCompleteWith(state: AnyRef, callback: Transformation[T, _]): Unit =
+      if (state.isInstanceOf[Callbacks[T]]) {
+        if (!compareAndSet(state, if (state ne Noop) concatCallbacks(callback, state.asInstanceOf[Callbacks[T]]) else callback)) {
+          dispatchOrAddCompleteWith(get(), callback)
+        }
+      } else {
+        callback.completeTarget(state.asInstanceOf[Try[T]], startingMaxDepth)
+      }
+
+    /** Tries to add the callback, if already completed, it dispatches the callback to be executed.
+      *  Used by everything but `completeWith()` to add callbacks to a promise.
+      */
+    @tailrec private final def dispatchOrAddCallback(state: AnyRef, callback: Transformation[T, _]): callback.type =
       if (state.isInstanceOf[Try[T]]) {
         callback.submitWithValue(state.asInstanceOf[Try[T]]) // invariant: callback should never be Noop here
       } else /* if (state.isInstanceOf[Callbacks[T]]) */ {
         if(compareAndSet(state, if (state ne Noop) concatCallbacks(callback, state.asInstanceOf[Callbacks[T]]) else callback)) callback
-        else dispatchOrAddCallbacks(get(), callback)
+        else dispatchOrAddCallback(get(), callback)
       }
 
     // IMPORTANT: Noop should never be passed in here, neither as callback OR as rest
@@ -244,14 +262,18 @@ private[concurrent] final object Promise {
 
     // IMPORTANT: Noop should not be passed in here, `callbacks` cannot be null
     @tailrec
-    private[this] final def submitWithValue(callbacks: Callbacks[T], resolved: Try[T]): Unit =
-      if(callbacks.isInstanceOf[ManyCallbacks[T]]) {
-        val m: ManyCallbacks[T] = callbacks.asInstanceOf[ManyCallbacks[T]]
-        m.first.submitWithValue(resolved)
-        submitWithValue(m.rest, resolved)
+    private[this] final def submitWithValue(callbacks: Callbacks[T], resolved: Try[T], maxDepth: Int): Unit = {
+      val first = callbacks.first
+      if (!first.isCompleteWith || maxDepth <= 0) {
+        first.submitWithValue(resolved)
       } else {
-        callbacks.asInstanceOf[Transformation[T, _]].submitWithValue(resolved)
+        first.completeTarget(resolved, maxDepth)
       }
+      val rest = callbacks.rest
+      if (rest ne null) {
+        submitWithValue(rest, resolved, maxDepth)
+      }
+    }
   }
 
   // Constant byte tags for unpacking transformation function inputs or outputs
@@ -272,7 +294,10 @@ private[concurrent] final object Promise {
 
     /* Marker trait
    */
-  sealed trait Callbacks[-T]
+  sealed trait Callbacks[-T] {
+      def first: Transformation[T, _]
+      def rest: Callbacks[T]
+    }
 
   final class ManyCallbacks[-T](final val first: Transformation[T,_], final val rest: Callbacks[T]) extends Callbacks[T] {
     override final def toString: String = "ManyCallbacks"
@@ -294,6 +319,18 @@ private[concurrent] final object Promise {
     final def this(xform: Int, f: _ => _, ec: ExecutionContext) = this(f.asInstanceOf[Any => Any], ec.prepare(): AnyRef, xform.toByte)
 
     final def benefitsFromBatching: Boolean = _xform != Xform_onComplete && _xform != Xform_foreach
+
+    final def first: Transformation[F, _] = this
+
+    final def rest: Callbacks[F] = null
+
+    final def isCompleteWith: Boolean = _xform == Xform_completeWith
+
+    final def completeTarget(resolved: Try[F], maxDepth: Int): Unit = {
+      val target = _fun.asInstanceOf[DefaultPromise[F]]
+      _fun = null
+      target.tryComplete1(target.get(), resolved, maxDepth)
+    }
 
     // Gets invoked when a value is available, schedules it to be run():ed by the ExecutionContext
     // submitWithValue *happens-before* run(), through ExecutionContext.execute.
